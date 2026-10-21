@@ -115,7 +115,7 @@ int main(int argc, char** argv)
   for(int i = 0; i < frames; ++i)
   {
     fp.frameIndex = uint32_t(i);
-    if(gpsRenderToHost(ctx, &fp, frame.data()) != GPS_SUCCESS)
+    if(gpsRenderToHost(ctx, &fp, frame.data(), nullptr) != GPS_SUCCESS)
     {
       printf("gpsRenderToHost failed: %s\n", gpsGetLastError());
       gpsDestroy(ctx);

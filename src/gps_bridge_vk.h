@@ -39,6 +39,7 @@ public:
     VkPhysicalDevice       physicalDevice = VK_NULL_HANDLE;
     nvslang::SlangCompiler* slangCompiler = nullptr;  // used once at init to build the resolve shader
     uint32_t               frameCycleSize = 3;
+    VkFormat               depthFormat    = VK_FORMAT_D32_SFLOAT;  // G-buffer depth format
   };
 
   // Per-frame parameters, independent of the GPS C API.
@@ -78,6 +79,10 @@ public:
   // (VK_IMAGE_LAYOUT_GENERAL, storage usage).
   void cmdResolve(VkCommandBuffer cmd, uint32_t frameSlot, VkImageView dstImageView);
 
+  // Records a fullscreen pass writing the GPS front-most point depth of frameSlot into
+  // depthImageView (VK_IMAGE_LAYOUT_GENERAL), so that visual helpers are occluded correctly.
+  void cmdWriteDepth(VkCommandBuffer cmd, uint32_t frameSlot, VkImageView depthImageView);
+
   GpsStats    stats() const;
   std::string deviceName() const;
   float       lastLoadSeconds() const { return m_lastLoadSeconds; }
@@ -93,6 +98,7 @@ private:
   bool createSharedBuffers(VkExtent2D size);
   void destroySharedBuffers();
   bool createResolvePipeline(nvslang::SlangCompiler* compiler);
+  bool createDepthPipeline(nvslang::SlangCompiler* compiler);
   void destroyResolvePipeline();
   uint32_t findDeviceLocalMemoryType(uint32_t typeBits) const;
 
@@ -116,6 +122,11 @@ private:
   VkDescriptorSetLayout m_dsetLayout     = VK_NULL_HANDLE;
   VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
   VkPipeline            m_pipeline       = VK_NULL_HANDLE;
+
+  VkFormat              m_depthFormat         = VK_FORMAT_D32_SFLOAT;
+  VkDescriptorSetLayout m_depthDsetLayout     = VK_NULL_HANDLE;
+  VkPipelineLayout      m_depthPipelineLayout = VK_NULL_HANDLE;
+  VkPipeline            m_depthPipeline       = VK_NULL_HANDLE;
 };
 
 }  // namespace vk_gaussian_splatting

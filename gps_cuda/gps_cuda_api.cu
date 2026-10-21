@@ -117,14 +117,43 @@ __global__ void fillFloatKernel(float* dst, float value, int n)
 }
 
 // GPS colour buffer (glm::vec3, row 0 = bottom) -> RGBA float, row 0 = top.
-__global__ void convertOutputKernel(const glm::vec3* __restrict__ src, float4* __restrict__ dst, int width, int height)
+// GPS depth buffer (OpenGL NDC z in [-1,1] of the front-most point, row 0 = bottom)
+// -> Vulkan [0,1] depth (perspectiveRH_ZO with the same near/far), row 0 = top.
+__global__ void convertOutputKernel(const glm::vec3* __restrict__ srcColor,
+                                    const float* __restrict__ srcDepth,
+                                    float4* __restrict__ dstColor,
+                                    float* __restrict__ dstDepth,
+                                    int   width,
+                                    int   height,
+                                    float nearPlane,
+                                    float farPlane)
 {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   if(x >= width || y >= height)
     return;
-  const glm::vec3 c                    = src[y * width + x];
-  dst[(height - 1 - y) * width + x]    = make_float4(c.x, c.y, c.z, 1.0f);
+  const int src = y * width + x;
+  const int dst = (height - 1 - y) * width + x;
+
+  const glm::vec3 c = srcColor[src];
+  dstColor[dst]     = make_float4(c.x, c.y, c.z, 1.0f);
+
+  if(dstDepth)
+  {
+    // invert CudaMath::view_to_projected_depth: z_ndc = A + B / z_view (z_view < 0)
+    const float A     = (farPlane + nearPlane) / (farPlane - nearPlane);
+    const float B     = (2.0f * farPlane * nearPlane) / (farPlane - nearPlane);
+    const float zNdc  = srcDepth[src];
+    float       depth = 1.0f;
+    if(zNdc < 1.0f - 1e-7f)
+    {
+      const float zView = B / (zNdc - A);  // negative
+      // perspectiveRH_ZO: depth = f/(f-n) + f*n / ((f-n) * z_view)
+      depth = farPlane / (farPlane - nearPlane) + (farPlane * nearPlane) / ((farPlane - nearPlane) * zView);
+      depth = fminf(fmaxf(depth, 0.0f), 1.0f);
+    }
+    dstDepth[dst] = depth;
+  }
 }
 
 struct OutputSlot
@@ -251,7 +280,7 @@ void applyFrameParams(GpsContext* ctx, const GpsFrameParams* p)
   s.copyToGPU();
 }
 
-GpsResult renderInternal(GpsContext* ctx, const GpsFrameParams* params, float4* dst)
+GpsResult renderInternal(GpsContext* ctx, const GpsFrameParams* params, float4* dstColor, float* dstDepth)
 {
   applyFrameParams(ctx, params);
 
@@ -261,7 +290,8 @@ GpsResult renderInternal(GpsContext* ctx, const GpsFrameParams* params, float4* 
 
   dim3 block(16, 16);
   dim3 grid((ctx->width + block.x - 1) / block.x, (ctx->height + block.y - 1) / block.y);
-  convertOutputKernel<<<grid, block>>>(ctx->d_color, dst, ctx->width, ctx->height);
+  convertOutputKernel<<<grid, block>>>(ctx->d_color, ctx->d_depth, dstColor, dstDepth, ctx->width, ctx->height,
+                                       ctx->settings.near_view_plane, ctx->settings.far_view_plane);
   GPS_CUDA_TRY(cudaGetLastError());
 
   GPS_CUDA_TRY(cudaEventRecord(ctx->evStop, 0));
@@ -412,7 +442,7 @@ GPS_API GpsResult gpsImportOutputBuffer(GpsContext* ctx, uint32_t slot, void* ha
 {
   if(!ctx || !handle || allocationSize == 0)
     return setError(GPS_ERROR_INVALID_ARG, "gpsImportOutputBuffer: invalid arguments");
-  const uint64_t needed = uint64_t(ctx->width) * uint64_t(ctx->height) * sizeof(float4);
+  const uint64_t needed = gpsOutputBufferSize(ctx->width, ctx->height);
   if(allocationSize < needed)
     return setError(GPS_ERROR_INVALID_ARG, "gpsImportOutputBuffer: allocation too small for the current resolution");
 
@@ -468,21 +498,27 @@ GPS_API GpsResult gpsRender(GpsContext* ctx, const GpsFrameParams* params, uint3
   if(!ctx || !params || slot >= ctx->slots.size() || !ctx->slots[slot].ptr)
     return setError(GPS_ERROR_INVALID_ARG, "gpsRender: invalid context, parameters or output slot");
   GPS_CUDA_TRY(cudaSetDevice(ctx->device));
-  return renderInternal(ctx, params, reinterpret_cast<float4*>(ctx->slots[slot].ptr));
+  char* base = reinterpret_cast<char*>(ctx->slots[slot].ptr);
+  return renderInternal(ctx, params, reinterpret_cast<float4*>(base),
+                        reinterpret_cast<float*>(base + gpsOutputDepthOffset(ctx->width, ctx->height)));
 }
 
-GPS_API GpsResult gpsRenderToHost(GpsContext* ctx, const GpsFrameParams* params, float* rgbaOut)
+GPS_API GpsResult gpsRenderToHost(GpsContext* ctx, const GpsFrameParams* params, float* rgbaOut, float* depthOut)
 {
   if(!ctx || !params || !rgbaOut)
     return setError(GPS_ERROR_INVALID_ARG, "gpsRenderToHost: invalid arguments");
   GPS_CUDA_TRY(cudaSetDevice(ctx->device));
-  const size_t bytes = size_t(ctx->width) * size_t(ctx->height) * sizeof(float4);
+  const size_t colorBytes = size_t(gpsOutputDepthOffset(ctx->width, ctx->height));
+  const size_t depthBytes = size_t(ctx->width) * size_t(ctx->height) * sizeof(float);
   if(!ctx->d_hostStaging)
-    GPS_CUDA_TRY(cudaMalloc((void**)&ctx->d_hostStaging, bytes));
-  GpsResult res = renderInternal(ctx, params, ctx->d_hostStaging);
+    GPS_CUDA_TRY(cudaMalloc((void**)&ctx->d_hostStaging, size_t(gpsOutputBufferSize(ctx->width, ctx->height))));
+  float* stagingDepth = reinterpret_cast<float*>(reinterpret_cast<char*>(ctx->d_hostStaging) + colorBytes);
+  GpsResult res       = renderInternal(ctx, params, ctx->d_hostStaging, stagingDepth);
   if(res != GPS_SUCCESS)
     return res;
-  GPS_CUDA_TRY(cudaMemcpy(rgbaOut, ctx->d_hostStaging, bytes, cudaMemcpyDeviceToHost));
+  GPS_CUDA_TRY(cudaMemcpy(rgbaOut, ctx->d_hostStaging, colorBytes, cudaMemcpyDeviceToHost));
+  if(depthOut)
+    GPS_CUDA_TRY(cudaMemcpy(depthOut, stagingDepth, depthBytes, cudaMemcpyDeviceToHost));
   return GPS_SUCCESS;
 }
 

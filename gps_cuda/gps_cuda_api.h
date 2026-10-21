@@ -14,6 +14,12 @@
  *    +Y up) expressed in the coordinate system of the PLY file as stored on disk.
  *  - Output images are RGBA float32, tightly packed, row 0 = top of the image
  *    (Vulkan convention). Alpha is always 1.
+ *  - Output buffers imported with gpsImportOutputBuffer hold two planes:
+ *      [0, w*h*16)          RGBA float32 color (as above)
+ *      [w*h*16, w*h*20)     float32 depth of the front-most splatted point per pixel, in
+ *                           Vulkan/D3D [0,1] convention (perspectiveRH_ZO with the frame's
+ *                           near/far planes), 1.0 where nothing was splatted.
+ *    Use gpsOutputBufferSize() to size them.
  *  - gpsRender* calls are synchronous: when they return, all CUDA work writing the
  *    output buffer has completed.
  */
@@ -36,7 +42,18 @@
 extern "C" {
 #endif
 
-#define GPS_CUDA_API_VERSION 1
+#define GPS_CUDA_API_VERSION 2
+
+// Size in bytes of an output buffer (color plane + depth plane) for the given resolution.
+static inline uint64_t gpsOutputBufferSize(int32_t width, int32_t height)
+{
+  return (uint64_t)width * (uint64_t)height * (4u * sizeof(float) + sizeof(float));
+}
+// Byte offset of the depth plane inside an output buffer.
+static inline uint64_t gpsOutputDepthOffset(int32_t width, int32_t height)
+{
+  return (uint64_t)width * (uint64_t)height * 4u * sizeof(float);
+}
 
 typedef struct GpsContext GpsContext;
 
@@ -108,7 +125,7 @@ GPS_API GpsResult gpsResize(GpsContext* ctx, int32_t width, int32_t height);
 // Imports an external (Vulkan) memory allocation as output buffer #slot.
 // handle: Win32 NT HANDLE on Windows, file descriptor (cast to pointer) on Linux.
 // The handle is not consumed; the caller can close it after this call on Windows.
-// The buffer must hold at least width*height*16 bytes at offset 0.
+// The buffer must hold at least gpsOutputBufferSize(width, height) bytes at offset 0.
 GPS_API GpsResult gpsImportOutputBuffer(GpsContext* ctx, uint32_t slot, void* handle, uint64_t allocationSize, int32_t dedicated);
 GPS_API void      gpsReleaseOutputBuffers(GpsContext* ctx);
 
@@ -116,7 +133,8 @@ GPS_API void      gpsReleaseOutputBuffers(GpsContext* ctx);
 GPS_API GpsResult gpsRender(GpsContext* ctx, const GpsFrameParams* params, uint32_t slot);
 
 // Renders one frame and copies the RGBA float image to host memory (width*height*4 floats).
-GPS_API GpsResult gpsRenderToHost(GpsContext* ctx, const GpsFrameParams* params, float* rgbaOut);
+// depthOut is optional (width*height floats, same convention as the output depth plane).
+GPS_API GpsResult gpsRenderToHost(GpsContext* ctx, const GpsFrameParams* params, float* rgbaOut, float* depthOut);
 
 GPS_API void        gpsGetStats(const GpsContext* ctx, GpsStats* stats);
 GPS_API const char* gpsGetLastError(void);

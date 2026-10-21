@@ -41,6 +41,7 @@ bool GpsBridgeVk::init(const InitInfo& info)
   m_device         = info.device;
   m_physicalDevice = info.physicalDevice;
   m_frameCycleSize = std::max(1u, info.frameCycleSize);
+  m_depthFormat    = info.depthFormat;
   m_available      = false;
 
   // Device UUID, used by gps_cuda to select the matching CUDA device
@@ -72,9 +73,9 @@ bool GpsBridgeVk::init(const InitInfo& info)
     return false;
   }
 
-  if(!createResolvePipeline(info.slangCompiler))
+  if(!createResolvePipeline(info.slangCompiler) || !createDepthPipeline(info.slangCompiler))
   {
-    m_unavailableReason = "failed to build the resolve compute shader";
+    m_unavailableReason = "failed to build the resolve/depth shaders";
     LOGW("GPS (CUDA) pipeline unavailable: %s\n", m_unavailableReason.c_str());
     return false;
   }
@@ -236,6 +237,49 @@ void GpsBridgeVk::cmdResolve(VkCommandBuffer cmd, uint32_t frameSlot, VkImageVie
   vkCmdDispatch(cmd, (m_size.width + 15) / 16, (m_size.height + 15) / 16, 1);
 }
 
+void GpsBridgeVk::cmdWriteDepth(VkCommandBuffer cmd, uint32_t frameSlot, VkImageView depthImageView)
+{
+  if(m_buffers.empty() || m_depthPipeline == VK_NULL_HANDLE)
+    return;
+  frameSlot %= uint32_t(m_buffers.size());
+
+  VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  depthAttachment.imageView   = depthImageView;
+  depthAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  depthAttachment.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // every pixel is written
+  depthAttachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  renderingInfo.renderArea       = {{0, 0}, m_size};
+  renderingInfo.layerCount       = 1;
+  renderingInfo.pDepthAttachment = &depthAttachment;
+
+  VkDescriptorBufferInfo srcInfo{m_buffers[frameSlot].buffer, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet   write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstBinding      = 0;
+  write.descriptorCount = 1;
+  write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.pBufferInfo     = &srcInfo;
+
+  struct
+  {
+    uint32_t width, height, depthOffset, pad;
+  } pc{m_size.width, m_size.height,
+       uint32_t(gpsOutputDepthOffset(int32_t(m_size.width), int32_t(m_size.height)) / sizeof(float)), 0};
+
+  const VkViewport viewport{0.0f, 0.0f, float(m_size.width), float(m_size.height), 0.0f, 1.0f};
+  const VkRect2D   scissor{{0, 0}, m_size};
+
+  vkCmdBeginRendering(cmd, &renderingInfo);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_depthPipeline);
+  vkCmdSetViewportWithCount(cmd, 1, &viewport);
+  vkCmdSetScissorWithCount(cmd, 1, &scissor);
+  vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_depthPipelineLayout, 0, 1, &write);
+  vkCmdPushConstants(cmd, m_depthPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+  vkCmdDraw(cmd, 3, 1, 0, 0);
+  vkCmdEndRendering(cmd);
+}
+
 GpsStats GpsBridgeVk::stats() const
 {
   GpsStats s{};
@@ -264,7 +308,7 @@ uint32_t GpsBridgeVk::findDeviceLocalMemoryType(uint32_t typeBits) const
 bool GpsBridgeVk::createSharedBuffers(VkExtent2D size)
 {
   destroySharedBuffers();
-  const VkDeviceSize bytes = VkDeviceSize(size.width) * size.height * 4 * sizeof(float);
+  const VkDeviceSize bytes = VkDeviceSize(gpsOutputBufferSize(int32_t(size.width), int32_t(size.height)));
 
   m_buffers.resize(m_frameCycleSize);
   for(uint32_t i = 0; i < m_frameCycleSize; ++i)
@@ -389,8 +433,99 @@ bool GpsBridgeVk::createResolvePipeline(nvslang::SlangCompiler* compiler)
   return res == VK_SUCCESS;
 }
 
+bool GpsBridgeVk::createDepthPipeline(nvslang::SlangCompiler* compiler)
+{
+  if(!compiler || !compiler->compileFile("gps_depth.slang") || compiler->getSpirvSize() == 0)
+    return false;
+
+  VkShaderModuleCreateInfo smInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smInfo.codeSize = compiler->getSpirvSize();
+  smInfo.pCode    = compiler->getSpirv();
+  VkShaderModule module{};
+  if(vkCreateShaderModule(m_device, &smInfo, nullptr, &module) != VK_SUCCESS)
+    return false;
+
+  VkDescriptorSetLayoutBinding binding{};
+  binding.binding         = 0;
+  binding.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  binding.descriptorCount = 1;
+  binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkDescriptorSetLayoutCreateInfo dslInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dslInfo.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+  dslInfo.bindingCount = 1;
+  dslInfo.pBindings    = &binding;
+  NVVK_CHECK(vkCreateDescriptorSetLayout(m_device, &dslInfo, nullptr, &m_depthDsetLayout));
+
+  VkPushConstantRange        pcRange{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(uint32_t)};
+  VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plInfo.setLayoutCount         = 1;
+  plInfo.pSetLayouts            = &m_depthDsetLayout;
+  plInfo.pushConstantRangeCount = 1;
+  plInfo.pPushConstantRanges    = &pcRange;
+  NVVK_CHECK(vkCreatePipelineLayout(m_device, &plInfo, nullptr, &m_depthPipelineLayout));
+
+  VkPipelineShaderStageCreateInfo stages[2]{};
+  stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = module;
+  stages[0].pName  = "vertmain";
+  stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = module;
+  stages[1].pName  = "fragmain";
+
+  VkPipelineVertexInputStateCreateInfo   vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.cullMode    = VK_CULL_MODE_NONE;
+  raster.lineWidth   = 1.0f;
+  VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  depthStencil.depthTestEnable  = VK_TRUE;
+  depthStencil.depthWriteEnable = VK_TRUE;
+  depthStencil.depthCompareOp   = VK_COMPARE_OP_ALWAYS;
+  VkPipelineColorBlendStateCreateInfo colorBlend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  const VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT};
+  VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates    = dynStates;
+
+  VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+  renderingInfo.depthAttachmentFormat = m_depthFormat;
+
+  VkGraphicsPipelineCreateInfo gpInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &renderingInfo};
+  gpInfo.stageCount          = 2;
+  gpInfo.pStages             = stages;
+  gpInfo.pVertexInputState   = &vertexInput;
+  gpInfo.pInputAssemblyState = &inputAssembly;
+  gpInfo.pViewportState      = &viewportState;
+  gpInfo.pRasterizationState = &raster;
+  gpInfo.pMultisampleState   = &multisample;
+  gpInfo.pDepthStencilState  = &depthStencil;
+  gpInfo.pColorBlendState    = &colorBlend;
+  gpInfo.pDynamicState       = &dynamic;
+  gpInfo.layout              = m_depthPipelineLayout;
+  VkResult res = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &gpInfo, nullptr, &m_depthPipeline);
+  vkDestroyShaderModule(m_device, module, nullptr);
+  NVVK_DBG_NAME(m_depthPipeline);
+  return res == VK_SUCCESS;
+}
+
 void GpsBridgeVk::destroyResolvePipeline()
 {
+  if(m_depthPipeline)
+    vkDestroyPipeline(m_device, m_depthPipeline, nullptr);
+  if(m_depthPipelineLayout)
+    vkDestroyPipelineLayout(m_device, m_depthPipelineLayout, nullptr);
+  if(m_depthDsetLayout)
+    vkDestroyDescriptorSetLayout(m_device, m_depthDsetLayout, nullptr);
+  m_depthPipeline       = VK_NULL_HANDLE;
+  m_depthPipelineLayout = VK_NULL_HANDLE;
+  m_depthDsetLayout     = VK_NULL_HANDLE;
   if(m_pipeline)
     vkDestroyPipeline(m_device, m_pipeline, nullptr);
   if(m_pipelineLayout)

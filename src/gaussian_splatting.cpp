@@ -235,7 +235,8 @@ void GaussianSplatting::onAttach(nvapp::Application* app)
   m_gps.init({.device         = m_device,
               .physicalDevice = m_app->getPhysicalDevice(),
               .slangCompiler  = &m_slangCompiler,
-              .frameCycleSize = m_app->getFrameCycleSize()});
+              .frameCycleSize = m_app->getFrameCycleSize(),
+              .depthFormat    = m_depthFormat});
 #endif
 
   // Request initial shader compilation — but skip it when a project is going to be loaded
@@ -2470,21 +2471,13 @@ void GaussianSplatting::renderGpsPipeline(VkCommandBuffer cmd, uint32_t splatCou
     nvvk::cmdMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
   }
 
-  // GPS does not produce a hardware depth buffer yet: clear it so that visual helpers are
-  // not occluded by depth left over from a previous pipeline.
+  // Hardware depth = depth of the front-most splatted GPS point (written by gps_cuda in the
+  // depth plane of the shared buffer). The visual helpers (grid, gizmo) sample this depth to
+  // hide occluded fragments, exactly like with the raster pipelines.
   {
-    VkRenderingAttachmentInfo depthAttachment = DEFAULT_VkRenderingAttachmentInfo;
-    depthAttachment.imageView                 = m_gBuffers.getDepthImageView();
-    depthAttachment.imageLayout               = VK_IMAGE_LAYOUT_GENERAL;
-    depthAttachment.loadOp                    = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.clearValue                = {.depthStencil = DEFAULT_VkClearDepthStencilValue};
-    VkRenderingInfo renderingInfo             = DEFAULT_VkRenderingInfo;
-    renderingInfo.renderArea                  = DEFAULT_VkRect2D(m_gBuffers.getSize());
-    renderingInfo.colorAttachmentCount        = 0;
-    renderingInfo.pColorAttachments           = nullptr;
-    renderingInfo.pDepthAttachment            = &depthAttachment;
-    vkCmdBeginRendering(cmd, &renderingInfo);
-    vkCmdEndRendering(cmd);
+    auto timerSection = m_profilerGpuTimer.cmdFrameSection(cmd, "GPS depth");
+    m_gps.cmdWriteDepth(cmd, frameSlot, m_gBuffers.getDepthImageView());
+    nvvk::cmdMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
   }
 
   // Temporal accumulation (GPS is stochastic, see onPreRender auto temporal sampling)
