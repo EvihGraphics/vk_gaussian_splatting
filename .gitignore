@@ -10,3 +10,8 @@ site/
 
 # Python
 __pycache__/
+
+# IDE
+.idea/
+.vscode/
+.vs/
