@@ -28,6 +28,8 @@
 #include "gaussian_splatting.h"
 #include "utilities.h"
 #include "memory_statistics.h"
+#include <algorithm>
+#include <cctype>
 #include "hardware_support.h"
 
 #define GLM_ENABLE_SWIZZLE
@@ -227,6 +229,15 @@ void GaussianSplatting::onAttach(nvapp::Application* app)
   // Initialize Tonemapper
   initTonemapper();
 
+#if defined(USE_GPS_CUDA)
+  // Gaussian Point Splatting (CUDA) pipeline: resolve shader + capability checks.
+  // The CUDA scene itself is loaded lazily when the pipeline gets selected.
+  m_gps.init({.device         = m_device,
+              .physicalDevice = m_app->getPhysicalDevice(),
+              .slangCompiler  = &m_slangCompiler,
+              .frameCycleSize = m_app->getFrameCycleSize()});
+#endif
+
   // Request initial shader compilation — but skip it when a project is going to be loaded
   // (--inputProject). The default-mesh pipeline compiled here would be thrown away as soon
   // as the project's settings/scene are applied. The project loader arms the compile itself
@@ -289,6 +300,10 @@ void GaussianSplatting::onDetach()
   // Cleanup Tonemapper
   deinitTonemapper();
 
+#if defined(USE_GPS_CUDA)
+  m_gps.deinit();
+#endif
+
   // Cleanup Sky, Sun & IBL
   m_sky.deinit();
   if(m_envAccelDummyBuffer.buffer != VK_NULL_HANDLE)
@@ -333,6 +348,10 @@ void GaussianSplatting::onResize(VkCommandBuffer cmd, const VkExtent2D& viewport
   updateRtDescriptorSet();
   updateDescriptorSetPostProcessing();
   resetFrameCounter();
+
+#if defined(USE_GPS_CUDA)
+  m_gps.resize(viewportSize);
+#endif
 
   // Notify ImageCompare of resize (invalidates reference and auto-disables comparison if size changed)
   m_imageCompare.resize(viewportSize);
@@ -409,6 +428,15 @@ void GaussianSplatting::onPreRender()
 
   coerceRasterParamsForSortingMethod();
 
+  // Coerce the GPS (CUDA) pipeline away when it is not compiled in (USE_GPS_CUDA=OFF)
+  // or not usable on this device (non NVIDIA, no external memory support, ...).
+  if(isGpsPipeline() && !isGpsPipelineAvailable())
+  {
+    LOGW("Gaussian Point Splatting (CUDA) pipeline not available - falling back to a raster pipeline.\n");
+    prmSelectedPipeline    = isSupported.meshShader ? PIPELINE_MESH : PIPELINE_VERT;
+    m_requestUpdateShaders = true;
+  }
+
   // Coerce particle depth away from billboard when the current configuration
   // does not support it. Billboard depth requires either AABBs (custom
   // intersection) or stochastic any-hit trace strategy.
@@ -443,7 +471,9 @@ void GaussianSplatting::onPreRender()
            || (m_sky.isEnabled() && m_sky.mode() != shaderio::EnvironmentMode::eNone && effectiveLightingMode())
            || (isRtxPipelineActive() && effectiveLightingMode())
            || (isRtxPipelineActive() && prmRtx.rtxTraceStrategy != RTX_TRACE_STRATEGY_FULL_ANYHIT)
-           || (isRasterPipelineActive() && prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT)))
+           || (isRasterPipelineActive() && prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT)
+           // Gaussian Point Splatting is stochastic by design and relies on accumulation
+           || isGpsPipeline()))
     {
       prmRtx.temporalSampling = true;
     }
@@ -491,6 +521,10 @@ void GaussianSplatting::onPreRender()
       prmSelectedPipeline    = isSupported.meshShader ? PIPELINE_MESH : PIPELINE_VERT;
       m_requestUpdateShaders = true;
     }
+
+    // Load (blocking) the GPS scene for the displayed splat set when needed
+    if(isGpsPipeline() && !isLoading)
+      updateGpsScene();
   }
 }
 
@@ -551,7 +585,11 @@ void GaussianSplatting::onRender(VkCommandBuffer cmd)
 
   // Do the actual rendering
   // RTX pipeline works for any scene composition (particles, meshes, environment-only, or empty)
-  if(m_shaders.valid && isRtxPipelineOnly())
+  if(isGpsPipeline())
+  {
+    renderGpsPipeline(cmd, splatCount, temporalConverged);
+  }
+  else if(m_shaders.valid && isRtxPipelineOnly())
   {
     renderPureRaytracingPipeline(cmd, splatCount, temporalConverged);
   }
@@ -2289,6 +2327,174 @@ void GaussianSplatting::reset()
 void GaussianSplatting::deinitScene()
 {
   m_currentLoadingSplatSetFilename = "";
+#if defined(USE_GPS_CUDA)
+  m_gps.releaseScene();
+#endif
+  m_gpsSceneReady          = false;
+  m_gpsMultiInstanceWarned = false;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Gaussian Point Splatting (CUDA) pipeline
+//--------------------------------------------------------------------------------------------------
+bool GaussianSplatting::isGpsPipelineAvailable() const
+{
+#if defined(USE_GPS_CUDA)
+  return m_gps.isAvailable();
+#else
+  return false;
+#endif
+}
+
+void GaussianSplatting::updateGpsScene()
+{
+#if defined(USE_GPS_CUDA)
+  // GPS renders a single splat set: the first visible instance backed by a .ply file
+  std::shared_ptr<SplatSetInstanceVk> instance;
+  size_t                              visibleCount = 0;
+  for(const auto& inst : m_assets.splatSets.getInstances())
+  {
+    if(!inst || !inst->shouldRender() || !inst->splatSet)
+      continue;
+    ++visibleCount;
+    if(!instance)
+      instance = inst;
+  }
+
+  std::string path;
+  if(instance)
+  {
+    std::filesystem::path p(instance->splatSet->path);
+    std::string           ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if(ext == ".ply")
+      path = instance->splatSet->path;
+    else if(!m_gpsMultiInstanceWarned)
+    {
+      LOGW("GPS (CUDA): only .ply splat sets are supported (got %s)\n", p.filename().string().c_str());
+      m_gpsMultiInstanceWarned = true;
+    }
+  }
+  if(visibleCount > 1 && !m_gpsMultiInstanceWarned)
+  {
+    LOGW("GPS (CUDA): %zu visible splat set instances, only the first one is rendered\n", visibleCount);
+    m_gpsMultiInstanceWarned = true;
+  }
+
+  if(path.empty())
+  {
+    if(m_gps.hasScene())
+    {
+      vkDeviceWaitIdle(m_device);
+      m_gps.releaseScene();
+    }
+    m_gpsSceneReady = false;
+    return;
+  }
+
+  const bool wasReady = m_gpsSceneReady && m_gps.scenePath() == path;
+  m_gpsSceneReady     = m_gps.ensureScene(path, m_gBuffers.getSize());
+  if(m_gpsSceneReady && !wasReady)
+    resetFrameCounter();
+#endif
+}
+
+void GaussianSplatting::renderGpsPipeline(VkCommandBuffer cmd, uint32_t splatCount, bool temporalConverged)
+{
+#if defined(USE_GPS_CUDA)
+  NVVK_DBG_SCOPE(cmd);
+
+  // Nothing to splat (yet): render meshes / empty background through the regular path
+  if(!m_gpsSceneReady || !m_gps.hasScene() || !m_shaders.valid || m_requestGBufferReinit)
+  {
+    renderHybridPipeline(cmd, splatCount, temporalConverged);
+    return;
+  }
+
+  // Converged: keep presenting the accumulated image
+  if(temporalConverged)
+    return;
+
+  // Frame UBO is read by the temporal accumulation (post.comp)
+  updateAndUploadFrameInfoUBO(cmd, splatCount);
+
+  // The instance whose splat set is rendered by GPS
+  glm::mat4 instanceTransform(1.0f);
+  for(const auto& inst : m_assets.splatSets.getInstances())
+  {
+    if(inst && inst->shouldRender() && inst->splatSet)
+    {
+      instanceTransform = inst->transform;
+      break;
+    }
+  }
+
+  GpsBridgeVk::FrameInput in;
+  in.viewMatrix        = glm::mat4(cameraManip->getViewMatrix());
+  in.instanceTransform = instanceTransform;
+  in.fovyDeg           = float(cameraManip->getFov());
+  in.nearPlane         = float(cameraManip->getClipPlanes().x);
+  in.farPlane          = float(cameraManip->getClipPlanes().y);
+  in.background        = glm::vec3(m_clearColor.float32[0], m_clearColor.float32[1], m_clearColor.float32[2]);
+  in.frameIndex        = m_gpsFrameIndex++;
+
+  const uint32_t frameSlot = m_app->getFrameCycleIndex();
+
+  // CUDA: synchronous, completes before this frame's command buffer is submitted.
+  // Profiled as a CPU-only section: its CPU time is the (blocking) CUDA frame time.
+  bool gpsOk = false;
+  {
+    auto cpuSection = m_profilerTimeline->frameSection("GPS CUDA");
+    gpsOk           = m_gps.render(in, frameSlot);
+  }
+  if(!gpsOk)
+  {
+    // Persistent CUDA failure: drop the scene and let onPreRender fall back / reload
+    vkDeviceWaitIdle(m_device);
+    m_gps.releaseScene();
+    m_gpsSceneReady = false;
+    renderHybridPipeline(cmd, splatCount, temporalConverged);
+    return;
+  }
+
+  // Same convention as the raster pipelines: first sample goes to MAIN, following ones to
+  // AUX1 and are accumulated into MAIN by postProcess()
+  const uint32_t colorBufferId = (prmFrame.frameSampleId > 0) ? COLOR_AUX1 : COLOR_MAIN;
+
+  {
+    auto timerSection = m_profilerGpuTimer.cmdFrameSection(cmd, "GPS resolve");
+
+    // Previous users of the G-buffer image (tonemap, image compare, presentation) are done
+    nvvk::cmdMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    m_gps.cmdResolve(cmd, frameSlot, m_gBuffers.getColorImageView(colorBufferId));
+    nvvk::cmdMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+  }
+
+  // GPS does not produce a hardware depth buffer yet: clear it so that visual helpers are
+  // not occluded by depth left over from a previous pipeline.
+  {
+    VkRenderingAttachmentInfo depthAttachment = DEFAULT_VkRenderingAttachmentInfo;
+    depthAttachment.imageView                 = m_gBuffers.getDepthImageView();
+    depthAttachment.imageLayout               = VK_IMAGE_LAYOUT_GENERAL;
+    depthAttachment.loadOp                    = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.clearValue                = {.depthStencil = DEFAULT_VkClearDepthStencilValue};
+    VkRenderingInfo renderingInfo             = DEFAULT_VkRenderingInfo;
+    renderingInfo.renderArea                  = DEFAULT_VkRect2D(m_gBuffers.getSize());
+    renderingInfo.colorAttachmentCount        = 0;
+    renderingInfo.pColorAttachments           = nullptr;
+    renderingInfo.pDepthAttachment            = &depthAttachment;
+    vkCmdBeginRendering(cmd, &renderingInfo);
+    vkCmdEndRendering(cmd);
+  }
+
+  // Temporal accumulation (GPS is stochastic, see onPreRender auto temporal sampling)
+  if((prmRender.visualize == VISUALIZE_FINAL || prmRender.visualize == VISUALIZE_CLAY) && prmRtx.temporalSampling)
+  {
+    postProcess(cmd);
+  }
+#else
+  renderHybridPipeline(cmd, splatCount, temporalConverged);
+#endif
 }
 
 uint32_t GaussianSplatting::getRtxParticleSetMode() const
@@ -2344,7 +2550,9 @@ void GaussianSplatting::updateSlangMacros()
 {
   m_shaderMacros =  // comment to force clang new line and better indent
       {
-          {"PIPELINE", std::to_string(prmSelectedPipeline)},
+          // The GPS (CUDA) pipeline has no Slang stage of its own; the shared shaders (meshes,
+          // post, ...) are compiled as for the raster mesh/vertex pipeline.
+          {"PIPELINE", std::to_string(isGpsPipeline() ? (isSupported.meshShader ? PIPELINE_MESH : PIPELINE_VERT) : prmSelectedPipeline)},
           // GPU vendor (GPU_VENDOR_NVIDIA/AMD/INTEL/OTHER) for vendor-gated shader paths
           {"GPU_VENDOR", std::to_string(isSupported.gpuVendor)},
           // Whether the mesh shaders may emit per-primitive attributes (NVIDIA only, see Slang #7019)

@@ -254,6 +254,9 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
   m_ui.enumAdd(GUI_PIPELINE, PIPELINE_RTX, "Ray tracing 3DGRT", rtxUnavailable);
   m_ui.enumAdd(GUI_PIPELINE, PIPELINE_HYBRID, "Hybrid 3DGS+3DGRT", meshUnavailable || rtxUnavailable);
   m_ui.enumAdd(GUI_PIPELINE, PIPELINE_HYBRID_3DGUT, "Hybrid 3DGUT+3DGRT", meshUnavailable || rtxUnavailable);
+  // Gaussian Point Splatting (CUDA): requires a USE_GPS_CUDA build, an NVIDIA GPU and
+  // VK_KHR_external_memory_win32/fd (checked in GpsBridgeVk::init).
+  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_GPS_CUDA, "Gaussian Point Splatting (CUDA)", !isGpsPipelineAvailable());
 
   m_ui.enumAdd(GUI_EXTENT_METHOD, EXTENT_EIGEN, "Eigen");
   m_ui.enumAdd(GUI_EXTENT_METHOD, EXTENT_CONIC, "Conic");
@@ -3359,6 +3362,61 @@ void GaussianSplattingUI::guiDrawRendererProperties()
         resetFrameCounter();
       }
 
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Gaussian Point Splatting (CUDA) ---
+  if(isGpsPipeline())
+  {
+    bool open = beginCollapsibleGroup("Gaussian Point Splatting (CUDA)", true);
+    if(open)
+    {
+      PE::begin("## GPS settings", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      bool changed = false;
+      changed |= PE::SliderInt("Supersampling", &prmGps.supersamplingFactor, 1, 4, "%d", 0,
+                               "Supersampling factor f: f x f samples per output pixel");
+      changed |= PE::Checkbox("Unbiased splatting", &prmGps.unbiasedSplatting,
+                              "Dilogarithm-corrected point counts and sampling,\n"
+                              "converges to sorted alpha blending");
+      changed |= PE::Checkbox("Occlusion culling", &prmGps.occlusionCulling, "Two-pass Hi-Z occlusion culling");
+      changed |= PE::Checkbox("Hierarchical culling", &prmGps.hierarchicalCulling,
+                              "Frustum/occlusion culling of Gaussian groups (BVH built at load)");
+      changed |= PE::Checkbox("K = f^2 points per thread", &prmGps.reducePointCount,
+                              "Off: one point per thread (paper K = 1), slower but more exact");
+      changed |= PE::Checkbox("Cull small Gaussians", &prmGps.cullSmallGaussians);
+      if(PE::SliderInt("Samples per pixel (reload)", &prmGps.samplesPerPixel, 1, 8, "%d", 0,
+                       "GPS render passes per frame. Changing it reloads the scene."))
+      {
+        changed = true;
+      }
+      if(changed)
+        resetFrameCounter();
+
+#if defined(USE_GPS_CUDA)
+      const GpsStats st = m_gps.stats();
+      PE::entry("Device", [&]() {
+        ImGui::TextUnformatted(m_gps.hasScene() ? m_gps.deviceName().c_str() : "(no scene loaded)");
+        return false;
+      });
+      PE::entry("Gaussians", [&]() {
+        ImGui::Text("%.2f M", double(st.numGaussians) * 1e-6);
+        return false;
+      });
+      PE::entry("CUDA frame time", [&]() {
+        ImGui::Text("%.3f ms", st.gpuTimeMs);
+        return false;
+      });
+      PE::entry("Points (pass 1 / 2)", [&]() {
+        ImGui::Text("%.2f M / %.2f M", double(st.pointsPass1) * 1e-6, double(st.pointsPass2) * 1e-6);
+        return false;
+      });
+      PE::entry("Scene load time", [&]() {
+        ImGui::Text("%.2f s", m_gps.lastLoadSeconds());
+        return false;
+      });
+#endif
       PE::end();
     }
     endCollapsibleGroup(open);

@@ -104,6 +104,10 @@
 
 #include "image_compare.h"
 
+#if defined(USE_GPS_CUDA)
+#include "gps_bridge_vk.h"
+#endif
+
 #include <nvshaders_host/tonemapper.hpp>
 
 namespace vk_gaussian_splatting {
@@ -174,6 +178,12 @@ protected:
 
   // Check if current pipeline is pure ray tracing (no rasterization)
   inline bool isRtxPipelineOnly() const { return prmSelectedPipeline == PIPELINE_RTX; }
+
+  // Gaussian Point Splatting (CUDA) pipeline, see gps_bridge_vk.h
+  inline bool isGpsPipeline() const { return prmSelectedPipeline == PIPELINE_GPS_CUDA; }
+
+  // True if the GPS (CUDA) pipeline is compiled in and usable on this device
+  bool isGpsPipelineAvailable() const;
 
   // Check if current pipeline uses rasterization (Vert, Mesh, Mesh 3DGUT, or Hybrid variants)
   inline bool isRasterPipelineActive() const
@@ -292,6 +302,12 @@ private:
   void renderPureRaytracingPipeline(VkCommandBuffer cmd, uint32_t splatCount, bool temporalConverged);
 
   void renderHybridPipeline(VkCommandBuffer cmd, uint32_t splatCount, bool temporalConverged);
+
+  // Gaussian Point Splatting (CUDA). Falls back to renderHybridPipeline when no GPS scene is ready.
+  void renderGpsPipeline(VkCommandBuffer cmd, uint32_t splatCount, bool temporalConverged);
+
+  // Loads/refreshes the GPS scene from the first visible .ply splat set instance (blocking)
+  void updateGpsScene();
 
   void renderVisualHelpers(VkCommandBuffer cmd);
 
@@ -636,6 +652,15 @@ protected:
   // Helper to map visualization mode to DLSS buffer
   shaderio::DlssImages getDlssBufferForVisuMode(int visualizeMode) const;
 #endif
+
+  ///////////////////////////////
+  // Gaussian Point Splatting (CUDA)
+#if defined(USE_GPS_CUDA)
+  GpsBridgeVk m_gps;
+#endif
+  uint32_t m_gpsFrameIndex       = 0;      // random seed source, increments every GPS frame
+  bool     m_gpsSceneReady       = false;  // GPS scene loaded for the current splat set
+  bool     m_gpsMultiInstanceWarned = false;
 };
 
 }  // namespace vk_gaussian_splatting

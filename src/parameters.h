@@ -290,6 +290,23 @@ struct RtxParameters
 // Parameters that control Raytracing (RTX)
 extern RtxParameters prmRtx;
 
+// Parameters of the Gaussian Point Splatting pipeline (PIPELINE_GPS_CUDA, gps_cuda.dll)
+// [Rijsdijk et al. 2026] https://github.com/JorisAR/gaussian-point-splatting
+struct GpsParameters
+{
+  // Per frame
+  int32_t supersamplingFactor = 2;  // 1..4, number of samples per output pixel = factor^2
+  bool    occlusionCulling    = true;
+  bool    hierarchicalCulling = true;
+  bool    unbiasedSplatting   = true;  // dilog-corrected point counts (converges to alpha blending)
+  bool    reducePointCount    = true;  // K = factor^2 points per thread (false: one point per thread)
+  bool    cullSmallGaussians  = false;
+  // Create time (changing them reloads the scene)
+  int32_t samplesPerPixel = 1;  // GPS render passes per pixel per frame
+};
+
+extern GpsParameters prmGps;
+
 // Parameters that control Comparison Mode (alias to ImageCompare::Parameters)
 using ComparisonParameters = ImageCompare::Parameters;
 

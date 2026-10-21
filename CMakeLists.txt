@@ -21,6 +21,19 @@ option(DISABLE_DEFAULT_SCENE "If set to true the default scene is not downloaded
 # DLSS Ray Reconstruction support
 option(USE_DLSS "Use DLSS-RR for denoising" ON)
 
+# Gaussian Point Splatting [Rijsdijk2026] CUDA pipeline (3rdparty/gaussian-point-splatting submodule)
+option(USE_GPS_CUDA "Build the Gaussian Point Splatting CUDA rendering pipeline (requires the CUDA toolkit)" OFF)
+if(USE_GPS_CUDA)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+  else()
+    message(WARNING "USE_GPS_CUDA=ON but no CUDA compiler was found - disabling the GPS pipeline")
+    set(USE_GPS_CUDA OFF CACHE BOOL "" FORCE)
+  endif()
+endif()
+
 # Download the default scene
 if (NOT DISABLE_DEFAULT_SCENE)
   add_definitions(-DWITH_DEFAULT_SCENE_FEATURE)
@@ -53,6 +66,8 @@ file(GLOB SOURCE_FILES src/*.*)
 # explicitly in the USE_DLSS block below. Exclude them from the glob so the
 # project builds with -DUSE_DLSS=OFF on platforms without NGX (e.g. AMD/RADV).
 list(FILTER SOURCE_FILES EXCLUDE REGEX "/dlss_")
+# Same for the GPS (CUDA) bridge, added in the USE_GPS_CUDA block below.
+list(FILTER SOURCE_FILES EXCLUDE REGEX "/gps_bridge_vk")
 file(GLOB SHADER_FILES shaders/*.slang shaders/*.h)
 file(GLOB EXTERN_FILES 3rdparty/miniply/*.*)
 
@@ -120,6 +135,23 @@ if(USE_DLSS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_denoiser.cpp 
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_denoiser.hpp
   )
+endif()
+
+#####################################################################################
+# Adding the Gaussian Point Splatting (CUDA) pipeline if selected
+# gps_cuda is a shared library (own glm / CUDA runtime, plain C API, see gps_cuda/gps_cuda_api.h)
+if(USE_GPS_CUDA)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/gps_cuda)
+  target_link_libraries(${PROJECT_NAME} PRIVATE gps_cuda)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE USE_GPS_CUDA)
+  target_sources(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gps_bridge_vk.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gps_bridge_vk.h
+  )
+  # gps_cuda.dll next to the executable (also for the install target)
+  add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gps_cuda> $<TARGET_FILE_DIR:${PROJECT_NAME}>)
+  install(FILES $<TARGET_FILE:gps_cuda> DESTINATION .)
 endif()
 
 #####################################################################################

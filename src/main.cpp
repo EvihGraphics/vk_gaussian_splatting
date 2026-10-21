@@ -154,6 +154,15 @@ int main(int argc, char** argv)
   // Memory budget extension for querying VRAM usage
   vkSetup.deviceExtensions.emplace_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
+#if defined(USE_GPS_CUDA)
+  // Gaussian Point Splatting (CUDA) pipeline: share output buffers with CUDA (optional)
+#if defined(_WIN32)
+  vkSetup.deviceExtensions.emplace_back("VK_KHR_external_memory_win32", nullptr, false);
+#else
+  vkSetup.deviceExtensions.emplace_back("VK_KHR_external_memory_fd", nullptr, false);
+#endif
+#endif
+
   // Fragment shader interlock for order-independent transparency (FTB rendering)
   static VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlockFeatures = {
       .sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,

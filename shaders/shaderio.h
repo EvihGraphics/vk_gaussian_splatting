@@ -106,6 +106,7 @@ enum class SplatDegree
 #define PIPELINE_HYBRID 3        // Hybrid rendering: raster primary rays (3DGS), raytrace secondary rays (3DGRT)
 #define PIPELINE_MESH_3DGUT 4    // 3DGUT (Unscented Transform) rasterization using mesh shaders
 #define PIPELINE_HYBRID_3DGUT 5  // Hybrid rendering: raster primary rays (3DGUT), raytrace secondary rays (3DGRT)
+#define PIPELINE_GPS_CUDA 6      // Gaussian Point Splatting [Rijsdijk2026], CUDA implementation (gps_cuda.dll, USE_GPS_CUDA)
 
 // visualization mode
 #define VISUALIZE_FINAL 0

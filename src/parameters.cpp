@@ -34,6 +34,7 @@ RenderParameters     prmRender{};
 RasterParameters     prmRaster{};
 RtxParameters        prmRtx{};
 ComparisonParameters prmComparison{};
+GpsParameters        prmGps{};
 
 // Storage for respective default values
 
@@ -134,7 +135,7 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
   parameterRegistry->add({"compressBlas", "1=compress BLAS (default). 0=diabled."}, &prmRtxData.compressBlas);
 
   // Pipelines
-  parameterRegistry->add({"pipeline", "0=3dgs-vert 1=3dgs-mesh(default) 2=3dgrt 3=hybrid-3dgs 4=3dgut 5=hybrid-3dgut"},
+  parameterRegistry->add({"pipeline", "0=3dgs-vert 1=3dgs-mesh(default) 2=3dgrt 3=hybrid-3dgs 4=3dgut 5=hybrid-3dgut 6=gps-cuda"},
                          &prmSelectedPipeline);
   parameterRegistry->add({"maxShDegree", "max sh degree used for rendering in [0,1,2,3]"}, &prmFrame.shDegree,
                          int32_t(0), int32_t(3));
@@ -170,6 +171,16 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
                          &prmRtx.shortenRay);
   parameterRegistry->add({"rtxBillboardBounding", "billboard bounding mode 0=fitted 1=uniform 2=uniform3/4 3=uniform2/3 4=uniform1/2 5=uniform1/3 6=uniform1/4 7=optimal"},
                          (int32_t*)&prmRtxData.billboardBoundingMode, int32_t(0), int32_t(7));
+
+  // Gaussian Point Splatting (CUDA) pipeline
+  parameterRegistry->add({"gpsSupersampling", "GPS supersampling factor in [1,4] (default 2)"}, &prmGps.supersamplingFactor,
+                         int32_t(1), int32_t(4));
+  parameterRegistry->add({"gpsSamplesPerPixel", "GPS render passes per pixel per frame (default 1)"},
+                         &prmGps.samplesPerPixel, int32_t(1), int32_t(16));
+  parameterRegistry->add({"gpsOcclusionCulling", "GPS occlusion culling 0=off 1=on(default)"}, &prmGps.occlusionCulling);
+  parameterRegistry->add({"gpsHierarchicalCulling", "GPS hierarchical culling 0=off 1=on(default)"}, &prmGps.hierarchicalCulling);
+  parameterRegistry->add({"gpsUnbiased", "GPS unbiased 2D splatting 0=off 1=on(default)"}, &prmGps.unbiasedSplatting);
+  parameterRegistry->add({"gpsReducePointCount", "GPS K=ss^2 points per thread 0=off 1=on(default)"}, &prmGps.reducePointCount);
 }
 
 }  // namespace vk_gaussian_splatting
