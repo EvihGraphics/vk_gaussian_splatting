@@ -387,6 +387,116 @@ def generate_comparison_image(ref_path, test_path, output_path, label="", raw_re
 
 
 # ----------------------------------------------------------------------------
+#   2.3 — Gaussian Point Splatting (CUDA) vs. Vulkan rasterization (dataset GPS)
+# ----------------------------------------------------------------------------
+
+# Sequence names of benchmark_gps.cfg. The first entry is the quality reference.
+GPS_REFERENCE_PIPELINE = "3DGS Mesh"
+GPS_PIPELINES = [
+    "3DGS Mesh",
+    "3DGS Mesh stochastic",
+    "GPS CUDA ss2",
+    "GPS CUDA ss1",
+    "GPS CUDA ss2 no culling",
+]
+# (pipeline, screenshot base name) — files are <scene_prefix>_screenshot_<base>_main.{png,raw}
+GPS_SCREENSHOT_DEFS = [
+    ("3DGS Mesh", "3dgs"),
+    ("3DGS Mesh stochastic", "3dgs_stochastic"),
+    ("GPS CUDA ss2", "gps_ss2"),
+    ("GPS CUDA ss1", "gps_ss1"),
+    ("GPS CUDA ss2 no culling", "gps_ss2_noculling"),
+]
+# Splatting work only (no UBO update, temporal accumulation, tone mapping, readbacks):
+#  - Vulkan raster: distance + sort + rasterization (Vulkan timestamps)
+#  - GPS: CUDA algorithm + output conversion (CUDA events) + Vulkan resolve/depth copies
+GPS_RENDER_STAGES = ["GPU Dist", "GPU Sort", "Rasterization", "GPS CUDA", "GPS CUDA output", "GPS resolve", "GPS depth"]
+GPS_PIPELINE_COLORS = [color_set["dark_green"], color_set["light_green"], color_set["blue"],
+                       color_set["teal"], color_set["purple"]]
+
+
+def _gpu_ms(timers, stages):
+    """Sum of the GPU ("VK" column) times of the given stages, in ms."""
+    return sum(timers.get(stage, {}).get("VK", 0.0) for stage in stages)
+
+
+def gps_compute_psnr(full_scene_paths):
+    """PSNR of every pipeline screenshot vs. the sorted 3DGS mesh reference, per scene."""
+    psnr_data = {}
+    ref_base = dict(GPS_SCREENSHOT_DEFS)[GPS_REFERENCE_PIPELINE]
+    for scene_name in full_scene_paths:
+        scene_prefix = f"benchmark_{scene_name.replace(' ', '_')}"
+        ref_file = f"{scene_prefix}_screenshot_{ref_base}_main.png"
+        ref_raw = f"{scene_prefix}_screenshot_{ref_base}_main.raw"
+        if not os.path.exists(ref_file):
+            print(f"Warning: reference screenshot not found: {ref_file}")
+            continue
+        psnr_data[scene_name] = {}
+        for pipeline, base in GPS_SCREENSHOT_DEFS:
+            if pipeline == GPS_REFERENCE_PIPELINE:
+                continue
+            test_file = f"{scene_prefix}_screenshot_{base}_main.png"
+            test_raw = f"{scene_prefix}_screenshot_{base}_main.raw"
+            if not os.path.exists(test_file):
+                print(f"Warning: screenshot not found: {test_file}")
+                continue
+            comp_file = f"{scene_prefix}_compare_{base}.png"
+            psnr = generate_comparison_image(ref_file, test_file, comp_file, label=pipeline,
+                                             raw_ref_path=ref_raw, raw_test_path=test_raw)
+            psnr_data[scene_name][pipeline] = psnr
+            print(f"  {scene_name} | {pipeline}: PSNR = {psnr:.2f} dB")
+    return psnr_data
+
+
+def gps_write_summary(all_results, psnr_data, filename="13_gps_summary_table.csv"):
+    """Per scene and pipeline: frame GPU time, splatting GPU time, CPU frame time, fps, speed-up, PSNR."""
+    by_key = {(r["scene"], r["name"]): r for r in all_results}
+    scenes = list(dict.fromkeys(r["scene"] for r in all_results))
+    rows = []
+    for scene in scenes:
+        ref = by_key.get((scene, GPS_REFERENCE_PIPELINE))
+        ref_render = _gpu_ms(ref["timers"], GPS_RENDER_STAGES) if ref else 0.0
+        for pipeline in GPS_PIPELINES:
+            result = by_key.get((scene, pipeline))
+            if not result:
+                continue
+            timers = result["timers"]
+            frame_gpu = timers.get("Frame", {}).get("VK", 0.0)
+            frame_cpu = timers.get("Frame", {}).get("CPU", 0.0)
+            render_gpu = _gpu_ms(timers, GPS_RENDER_STAGES)
+            cuda_ms = timers.get("GPS CUDA", {}).get("VK", 0.0)
+            if pipeline == GPS_REFERENCE_PIPELINE:
+                psnr = "ref"
+            else:
+                value = psnr_data.get(scene, {}).get(pipeline)
+                psnr = f"{value:.2f}" if value is not None else ""
+            rows.append([
+                scene, pipeline,
+                f"{frame_gpu:.3f}", f"{render_gpu:.3f}", f"{cuda_ms:.3f}" if cuda_ms > 0 else "",
+                f"{frame_cpu:.3f}", f"{1000.0 / frame_cpu:.1f}" if frame_cpu > 0 else "",
+                f"{ref_render / render_gpu:.2f}" if render_gpu > 0 and ref_render > 0 else "",
+                psnr,
+            ])
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Scene", "Pipeline", "Frame GPU (ms)", "Splatting GPU (ms)", "of which CUDA (ms)",
+                         "Frame CPU (ms)", "FPS", "Splatting speed-up vs Mesh", "PSNR vs Mesh (dB)"])
+        writer.writerows(rows)
+    print(f"Summary table saved as {filename}")
+
+    # Console summary: average over scenes
+    print("\nAverage over scenes (splatting GPU time, PSNR vs mesh):")
+    for pipeline in GPS_PIPELINES:
+        times = [_gpu_ms(by_key[(s, pipeline)]["timers"], GPS_RENDER_STAGES) for s in scenes if (s, pipeline) in by_key]
+        psnrs = [psnr_data[s][pipeline] for s in psnr_data if pipeline in psnr_data[s]]
+        if times:
+            line = f"  {pipeline:<26} {np.mean(times):8.3f} ms"
+            if psnrs:
+                line += f"   {np.mean(psnrs):6.2f} dB"
+            print(line)
+
+
+# ----------------------------------------------------------------------------
 #   2.2 — Charts: Billboard Bounding Mode Comparison
 # ----------------------------------------------------------------------------
 
@@ -777,7 +887,8 @@ def plot_cumulative_histogram_timers(
         for benchmark_name, timers in results:
             for stage in stages:
                 if mstofps:
-                    scene_data[benchmark_name][stage] += 1000.0 / timers.get(stage, {}).get(device, 0)
+                    stage_ms = timers.get(stage, {}).get(device, 0)
+                    scene_data[benchmark_name][stage] += 1000.0 / stage_ms if stage_ms > 0 else 0
                 else:
                     scene_data[benchmark_name][stage] += timers.get(stage, {}).get(device, 0)
         all_data.append(scene_data)
@@ -873,7 +984,8 @@ def plot_histogram_timers(
         for benchmark_name, timers in results:
             for stage in stages:
                 if mstofps:
-                    scene_data[benchmark_name][stage] += 1000.0 / timers.get(stage, {}).get(device, 0)
+                    stage_ms = timers.get(stage, {}).get(device, 0)
+                    scene_data[benchmark_name][stage] += 1000.0 / stage_ms if stage_ms > 0 else 0
                 else:
                     scene_data[benchmark_name][stage] += timers.get(stage, {}).get(device, 0)
         all_data.append(scene_data)
@@ -1039,7 +1151,9 @@ if __name__ == "__main__":
     # Setup argument parsing for the base dataset path
     parser = argparse.ArgumentParser(description="Run benchmarks for 3D scenes.")
     parser.add_argument("benchmark", type=str, help="path to the benchmark .cfg file")
-    parser.add_argument("dataset", type=str, choices=["3DGS", "3DGRT", "3DGUT", "3DGS_BILLBOARDS"], help="Dataset to use")
+    parser.add_argument("dataset", type=str, choices=["3DGS", "3DGRT", "3DGUT", "3DGS_BILLBOARDS", "GPS"],
+                        help="Dataset to use (GPS: INRIA 3DGS scenes, Gaussian Point Splatting CUDA vs. Vulkan raster, "
+                             "requires a -DUSE_GPS_CUDA=ON build)")
     parser.add_argument("dataset_path", type=str, help="Base path to the dataset")
     parser.add_argument("csv_name", type=str, help="Name of the output csv file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print benchmark output to console in real-time")
@@ -1047,6 +1161,8 @@ if __name__ == "__main__":
     parser.add_argument("--forcegpu", type=int, metavar="ID", default=None,
                         help="Forward --forcegpu ID to the app (Vulkan physical device index)")
     parser.add_argument("--skip-exec", action="store_true", help="Skip execution, re-analyze existing results in _benchmark/")
+    parser.add_argument("--scenes", type=str, default="",
+                        help="Comma-separated substrings to select a subset of the dataset scenes (e.g. 'bonsai,bicycle')")
 
     args = parser.parse_args()
 
@@ -1109,12 +1225,25 @@ if __name__ == "__main__":
     }
 
     # Select the appropriate scenes based on the dataset argument
-    if args.dataset == "3DGS":
+    if args.dataset in ("3DGS", "GPS"):
         selected_scenes = scenes
     elif args.dataset == "3DGS_BILLBOARDS":
         selected_scenes = billboard_scenes
     else:
         selected_scenes = rt_scenes
+
+    def resolve_dataset_path(base, relative):
+        """Join base and relative path. If missing, also accept the flat INRIA layout
+        ("bicycle/point_cloud/..." instead of "bicycle/bicycle/point_cloud/...")."""
+        path = os.path.join(base, relative)
+        if os.path.exists(path):
+            return path
+        parts = relative.replace("\\", "/").split("/")
+        if len(parts) > 2 and parts[0] == parts[1]:
+            flat = os.path.join(base, *parts[1:])
+            if os.path.exists(flat):
+                return flat
+        return path
 
     # Build the full paths by combining the dataset path and scene relative paths
     full_scene_paths = {}
@@ -1122,8 +1251,13 @@ if __name__ == "__main__":
         ply_relative = scene_tuple[0]
         cam_relative = scene_tuple[1] if len(scene_tuple) > 1 else ""
         camera_presets = scene_tuple[2] if len(scene_tuple) > 2 else []
-        ply_path = os.path.join(args.dataset_path, ply_relative)
-        cam_path = os.path.join(args.dataset_path, cam_relative) if cam_relative else ""
+        ply_path = resolve_dataset_path(args.dataset_path, ply_relative)
+        cam_path = resolve_dataset_path(args.dataset_path, cam_relative) if cam_relative else ""
+        if not args.skip_exec and not os.path.exists(ply_path):
+            print(f"Warning: scene file not found, skipping '{scene_name}': {ply_path}")
+            continue
+        if args.scenes and not any(s.lower() in scene_name.lower() for s in args.scenes.split(",")):
+            continue
         full_scene_paths[scene_name] = (ply_path, cam_path, camera_presets)
     
     # Prepare the benchmark directory and output files
@@ -1230,6 +1364,57 @@ if __name__ == "__main__":
             pipeline_names= ["fp32", "fp16", "uint8"],
             stages=["Scene", "Rasterization"], 
             filename="06_histogram_format_memory.png")
+
+    if args.dataset == "GPS":
+        gps_legend = ["A - VK3DGS mesh, GPU radix sort (reference)",
+                      "B - VK3DGS mesh, stochastic splat",
+                      "C - GPS CUDA, supersampling 2x2",
+                      "D - GPS CUDA, supersampling 1x1",
+                      "E - GPS CUDA 2x2, no occlusion/hierarchical culling"]
+
+        plot_histogram_timers(
+            all_results,
+            xlabel="Scene",
+            ylabel="Splatting GPU time (milliseconds)",
+            title="Gaussian Point Splatting (CUDA) vs. VK3DGS rasterization - splatting GPU time (ms)\n"
+                  "Vulkan timestamps (dist + sort + raster / resolve) + CUDA events (GPS) - 1920x1080",
+            pipelines=GPS_PIPELINES,
+            pipeline_names=GPS_PIPELINES,
+            stages=GPS_RENDER_STAGES,
+            stage_colors=GPS_PIPELINE_COLORS,
+            legend=gps_legend,
+            filename="10_gps_histogram_splatting_gpu_time.png")
+
+        plot_histogram_timers(
+            all_results,
+            xlabel="Scene",
+            ylabel="Frame GPU time (milliseconds)",
+            title="Gaussian Point Splatting (CUDA) vs. VK3DGS rasterization - full frame GPU time (ms)\n"
+                  "includes temporal accumulation for the stochastic pipelines - 1920x1080",
+            pipelines=GPS_PIPELINES,
+            pipeline_names=GPS_PIPELINES,
+            stages=["Frame"],
+            stage_colors=GPS_PIPELINE_COLORS,
+            legend=gps_legend,
+            filename="11_gps_histogram_frame_gpu_time.png")
+
+        plot_histogram_timers(
+            all_results,
+            xlabel="Scene",
+            ylabel="Frames per second",
+            title="Gaussian Point Splatting (CUDA) vs. VK3DGS rasterization - framerate (fps, CPU frame time)\n"
+                  "GPS runs synchronously (CUDA work + host readbacks are on the frame's critical path) - 1920x1080",
+            pipelines=GPS_PIPELINES,
+            pipeline_names=GPS_PIPELINES,
+            stages=["Frame"],
+            stage_colors=GPS_PIPELINE_COLORS,
+            legend=gps_legend,
+            device="CPU",
+            mstofps=True,
+            filename="12_gps_histogram_fps.png")
+
+        psnr_data = gps_compute_psnr(full_scene_paths)
+        gps_write_summary(all_results, psnr_data)
 
     if args.dataset == "3DGRT":
         plot_histogram_timers(

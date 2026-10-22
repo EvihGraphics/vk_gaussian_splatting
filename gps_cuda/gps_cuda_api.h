@@ -42,7 +42,7 @@
 extern "C" {
 #endif
 
-#define GPS_CUDA_API_VERSION 2
+#define GPS_CUDA_API_VERSION 3
 
 // Size in bytes of an output buffer (color plane + depth plane) for the given resolution.
 static inline uint64_t gpsOutputBufferSize(int32_t width, int32_t height)
@@ -103,12 +103,17 @@ typedef struct GpsFrameParams
   int32_t cullSmallGaussians;
 } GpsFrameParams;
 
+// CUDA event timings of the last gpsRender* call, in milliseconds. Events are recorded on the
+// stream used by GPS, so they measure the GPU timeline span of the work, including the short
+// GPU idle gaps caused by the host synchronizations inside GPS (point-count readbacks).
 typedef struct GpsStats
 {
   uint64_t numGaussians;
   uint32_t pointsPass1;
   uint32_t pointsPass2;
-  float    gpuTimeMs;  // CUDA time of the last gpsRender* call (GPS passes + output conversion)
+  float    gpuTimeMs;     // splatTimeMs + outputTimeMs
+  float    splatTimeMs;   // GPS algorithm: preprocess, workload distribution, splatting, combine (2 passes)
+  float    outputTimeMs;  // conversion into the output buffer (color + depth planes)
 } GpsStats;
 
 // Fills sensible defaults.

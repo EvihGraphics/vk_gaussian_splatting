@@ -39,6 +39,7 @@
 #include <glm/gtx/transform.hpp>
 // threading
 #include <thread>
+#include <unordered_map>
 #include <condition_variable>
 #include <mutex>
 // GPU radix sort
@@ -661,6 +662,13 @@ protected:
   uint32_t m_gpsFrameIndex       = 0;      // random seed source, increments every GPS frame
   bool     m_gpsSceneReady       = false;  // GPS scene loaded for the current splat set
   bool     m_gpsMultiInstanceWarned = false;
+  GpsParameters m_gpsLastParams{};          // to reset temporal accumulation when GPS settings change
+
+  // Profiler "GPU time" provider for the CUDA sections ("GPS CUDA", "GPS CUDA output").
+  // GPS runs synchronously, so its CUDA event times are known when the section closes; they are
+  // stored per profiler query slot and handed to the profiler when it collects the frame.
+  nvutils::ProfilerTimeline::GpuTimeProvider m_gpsCudaTimeProvider;
+  std::unordered_map<uint32_t, double>       m_gpsCudaTimesUs;
 };
 
 }  // namespace vk_gaussian_splatting

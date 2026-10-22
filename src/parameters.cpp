@@ -181,6 +181,11 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
   parameterRegistry->add({"gpsHierarchicalCulling", "GPS hierarchical culling 0=off 1=on(default)"}, &prmGps.hierarchicalCulling);
   parameterRegistry->add({"gpsUnbiased", "GPS unbiased 2D splatting 0=off 1=on(default)"}, &prmGps.unbiasedSplatting);
   parameterRegistry->add({"gpsReducePointCount", "GPS K=ss^2 points per thread 0=off 1=on(default)"}, &prmGps.reducePointCount);
+  parameterRegistry->add({"gpsCullSmall", "GPS cull small Gaussians 0=off(default) 1=on"}, &prmGps.cullSmallGaussians);
+  parameterRegistry->add({"gpsIsolateGpuTiming",
+                          "GPS benchmarking: wait for Vulkan idle before the CUDA work so CUDA event timings are not "
+                          "overlapped by Vulkan work 0=off(default) 1=on"},
+                         &prmGps.isolateGpuTiming);
 }
 
 }  // namespace vk_gaussian_splatting

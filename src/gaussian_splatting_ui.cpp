@@ -3404,8 +3404,8 @@ void GaussianSplattingUI::guiDrawRendererProperties()
         ImGui::Text("%.2f M", double(st.numGaussians) * 1e-6);
         return false;
       });
-      PE::entry("CUDA frame time", [&]() {
-        ImGui::Text("%.3f ms", st.gpuTimeMs);
+      PE::entry("CUDA GPU time", [&]() {
+        ImGui::Text("%.3f ms (splat %.3f + output %.3f)", st.gpuTimeMs, st.splatTimeMs, st.outputTimeMs);
         return false;
       });
       PE::entry("Points (pass 1 / 2)", [&]() {

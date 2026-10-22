@@ -181,8 +181,9 @@ struct GpsContext
 
   std::vector<OutputSlot> slots;
 
-  cudaEvent_t evStart = nullptr, evStop = nullptr;
-  float       lastGpuMs = 0.0f;
+  cudaEvent_t evStart = nullptr, evSplatDone = nullptr, evStop = nullptr;
+  float       lastSplatMs  = 0.0f;  // GaussianPointSplatting::render (both passes, culling, combine)
+  float       lastOutputMs = 0.0f;  // conversion into the host output buffer
 };
 
 namespace {
@@ -288,6 +289,8 @@ GpsResult renderInternal(GpsContext* ctx, const GpsFrameParams* params, float4* 
 
   ctx->pass->render(ctx->d_color, ctx->d_depth, ctx->settings);
 
+  GPS_CUDA_TRY(cudaEventRecord(ctx->evSplatDone, 0));
+
   dim3 block(16, 16);
   dim3 grid((ctx->width + block.x - 1) / block.x, (ctx->height + block.y - 1) / block.y);
   convertOutputKernel<<<grid, block>>>(ctx->d_color, ctx->d_depth, dstColor, dstDepth, ctx->width, ctx->height,
@@ -298,7 +301,8 @@ GpsResult renderInternal(GpsContext* ctx, const GpsFrameParams* params, float4* 
   // Synchronous by contract: the host submits Vulkan work reading dst right after this call.
   GPS_CUDA_TRY(cudaEventSynchronize(ctx->evStop));
   GPS_CUDA_TRY(cudaGetLastError());
-  cudaEventElapsedTime(&ctx->lastGpuMs, ctx->evStart, ctx->evStop);
+  cudaEventElapsedTime(&ctx->lastSplatMs, ctx->evStart, ctx->evSplatDone);
+  cudaEventElapsedTime(&ctx->lastOutputMs, ctx->evSplatDone, ctx->evStop);
   return GPS_SUCCESS;
 }
 
@@ -380,6 +384,8 @@ GPS_API GpsResult gpsCreate(const GpsCreateInfo* info, GpsContext** outContext)
   if(res == GPS_SUCCESS)
     res = checkCuda(cudaEventCreate(&ctx->evStart), "cudaEventCreate");
   if(res == GPS_SUCCESS)
+    res = checkCuda(cudaEventCreate(&ctx->evSplatDone), "cudaEventCreate");
+  if(res == GPS_SUCCESS)
     res = checkCuda(cudaEventCreate(&ctx->evStop), "cudaEventCreate");
   if(res == GPS_SUCCESS)
     res = resetDepthPyramid(ctx);
@@ -408,6 +414,8 @@ GPS_API void gpsDestroy(GpsContext* ctx)
   ctx->settings.d_frustumPlanes = nullptr;
   if(ctx->evStart)
     cudaEventDestroy(ctx->evStart);
+  if(ctx->evSplatDone)
+    cudaEventDestroy(ctx->evSplatDone);
   if(ctx->evStop)
     cudaEventDestroy(ctx->evStop);
   delete ctx;
@@ -529,7 +537,9 @@ GPS_API void gpsGetStats(const GpsContext* ctx, GpsStats* stats)
   stats->numGaussians = ctx->numGaussians;
   stats->pointsPass1  = uint32_t(ctx->statistics.numPointsOne);
   stats->pointsPass2  = ctx->settings.enable_occlusion_culling ? uint32_t(ctx->statistics.numPointsTwo) : 0u;
-  stats->gpuTimeMs    = ctx->lastGpuMs;
+  stats->gpuTimeMs    = ctx->lastSplatMs + ctx->lastOutputMs;
+  stats->splatTimeMs  = ctx->lastSplatMs;
+  stats->outputTimeMs = ctx->lastOutputMs;
 }
 
 GPS_API const char* gpsGetLastError(void)

@@ -301,6 +301,9 @@ struct GpsParameters
   bool    unbiasedSplatting   = true;  // dilog-corrected point counts (converges to alpha blending)
   bool    reducePointCount    = true;  // K = factor^2 points per thread (false: one point per thread)
   bool    cullSmallGaussians  = false;
+  // Benchmarking: wait for the Vulkan queue to be idle before the CUDA work so that the CUDA
+  // event timings are not inflated by the previous frame's Vulkan work running concurrently.
+  bool isolateGpuTiming = false;
   // Create time (changing them reloads the scene)
   int32_t samplesPerPixel = 1;  // GPS render passes per pixel per frame
 };

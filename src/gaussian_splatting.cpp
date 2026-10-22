@@ -30,6 +30,7 @@
 #include "memory_statistics.h"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include "hardware_support.h"
 
 #define GLM_ENABLE_SWIZZLE
@@ -237,6 +238,18 @@ void GaussianSplatting::onAttach(nvapp::Application* app)
               .slangCompiler  = &m_slangCompiler,
               .frameCycleSize = m_app->getFrameCycleSize(),
               .depthFormat    = m_depthFormat});
+
+  // CUDA event timings reported as the "GPU" time of the GPS profiler sections
+  m_gpsCudaTimeProvider.apiName       = "CUDA";
+  m_gpsCudaTimeProvider.frameFunction = [this](nvutils::ProfilerTimeline::FrameSectionID sec, double& gpuTime) {
+    auto it = m_gpsCudaTimesUs.find(nvutils::ProfilerTimeline::GpuTimeProvider::getTimerBaseIdx(sec));
+    if(it == m_gpsCudaTimesUs.end())
+      return false;
+    gpuTime = it->second;
+    m_gpsCudaTimesUs.erase(it);
+    return true;
+  };
+  m_gpsCudaTimeProvider.asyncFunction = [](nvutils::ProfilerTimeline::AsyncSectionID, double&) { return false; };
 #endif
 
   // Request initial shader compilation — but skip it when a project is going to be loaded
@@ -2416,6 +2429,14 @@ void GaussianSplatting::renderGpsPipeline(VkCommandBuffer cmd, uint32_t splatCou
   if(temporalConverged)
     return;
 
+  // Any GPS setting change (UI or command line / benchmark sequence) restarts accumulation
+  if(std::memcmp(&m_gpsLastParams, &prmGps, sizeof(GpsParameters)) != 0)
+  {
+    m_gpsLastParams = prmGps;
+    resetFrameCounter();
+    prmFrame.frameSampleId = 0;
+  }
+
   // Frame UBO is read by the temporal accumulation (post.comp)
   updateAndUploadFrameInfoUBO(cmd, splatCount);
 
@@ -2441,12 +2462,25 @@ void GaussianSplatting::renderGpsPipeline(VkCommandBuffer cmd, uint32_t splatCou
 
   const uint32_t frameSlot = m_app->getFrameCycleIndex();
 
+  // Benchmarking: make sure no Vulkan work from previous frames runs concurrently with the
+  // CUDA work, so that the CUDA event timings only cover GPS.
+  if(prmGps.isolateGpuTiming)
+    vkQueueWaitIdle(m_app->getQueue(0).queue);
+
   // CUDA: synchronous, completes before this frame's command buffer is submitted.
-  // Profiled as a CPU-only section: its CPU time is the (blocking) CUDA frame time.
+  // Profiler sections: CPU = blocking host time, GPU = CUDA event time (m_gpsCudaTimeProvider).
   bool gpsOk = false;
   {
-    auto cpuSection = m_profilerTimeline->frameSection("GPS CUDA");
-    gpsOk           = m_gps.render(in, frameSlot);
+    using Timeline = nvutils::ProfilerTimeline;
+    Timeline::FrameSectionID secSplat = m_profilerTimeline->frameBeginSection("GPS CUDA", &m_gpsCudaTimeProvider);
+    gpsOk                             = m_gps.render(in, frameSlot);
+    const GpsStats st                 = m_gps.stats();
+    m_gpsCudaTimesUs[Timeline::GpuTimeProvider::getTimerBaseIdx(secSplat)] = gpsOk ? double(st.splatTimeMs) * 1000.0 : 0.0;
+    m_profilerTimeline->frameEndSection(secSplat);
+
+    Timeline::FrameSectionID secOut = m_profilerTimeline->frameBeginSection("GPS CUDA output", &m_gpsCudaTimeProvider);
+    m_gpsCudaTimesUs[Timeline::GpuTimeProvider::getTimerBaseIdx(secOut)] = gpsOk ? double(st.outputTimeMs) * 1000.0 : 0.0;
+    m_profilerTimeline->frameEndSection(secOut);
   }
   if(!gpsOk)
   {

@@ -111,29 +111,36 @@ int main(int argc, char** argv)
 
   std::vector<float>  frame(size_t(width) * height * 4);
   std::vector<double> accum(size_t(width) * height * 3, 0.0);
-  double              gpuSum = 0.0;
+  double              gpuSum = 0.0, splatSum = 0.0, wallSum = 0.0;
   for(int i = 0; i < frames; ++i)
   {
     fp.frameIndex = uint32_t(i);
+    auto tw0      = std::chrono::high_resolution_clock::now();
     if(gpsRenderToHost(ctx, &fp, frame.data(), nullptr) != GPS_SUCCESS)
     {
       printf("gpsRenderToHost failed: %s\n", gpsGetLastError());
       gpsDestroy(ctx);
       return 3;
     }
+    auto     tw1 = std::chrono::high_resolution_clock::now();
     GpsStats st;
     gpsGetStats(ctx, &st);
     if(i > 0)  // first frame includes warm-up
+    {
       gpuSum += st.gpuTimeMs;
+      splatSum += st.splatTimeMs;
+      wallSum += std::chrono::duration<double, std::milli>(tw1 - tw0).count();
+    }
     if(i == 0 || i == frames - 1)
-      printf("frame %d: %.3f ms, points pass1 %u pass2 %u, gaussians %llu\n", i, st.gpuTimeMs, st.pointsPass1,
-             st.pointsPass2, (unsigned long long)st.numGaussians);
+      printf("frame %d: %.3f ms (splat %.3f, output %.3f), points pass1 %u pass2 %u, gaussians %llu\n", i,
+             st.gpuTimeMs, st.splatTimeMs, st.outputTimeMs, st.pointsPass1, st.pointsPass2, (unsigned long long)st.numGaussians);
     for(size_t p = 0; p < size_t(width) * height; ++p)
       for(int c = 0; c < 3; ++c)
         accum[p * 3 + c] += frame[p * 4 + c];
   }
   if(frames > 1)
-    printf("average GPS frame time (excluding first): %.3f ms\n", gpuSum / (frames - 1));
+    printf("average over %d frames (excluding first): CUDA events %.3f ms (splat %.3f), host wall incl. readback %.3f ms\n",
+           frames - 1, gpuSum / (frames - 1), splatSum / (frames - 1), wallSum / (frames - 1));
 
   std::vector<unsigned char> png(size_t(width) * height * 3);
   for(size_t i = 0; i < png.size(); ++i)
