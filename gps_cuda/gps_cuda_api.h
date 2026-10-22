@@ -13,7 +13,9 @@
  *  - The view matrix is an OpenGL-style view (right-handed, camera looks down -Z,
  *    +Y up) expressed in the coordinate system of the PLY file as stored on disk.
  *  - Output images are RGBA float32, tightly packed, row 0 = top of the image
- *    (Vulkan convention). Alpha is always 1.
+ *    (Vulkan convention). RGB is the average of the pixel's samples, missed samples taking the
+ *    background color (so with a black background RGB is premultiplied by alpha). Alpha is the
+ *    pixel coverage, see GpsFrameParams::backgroundAlpha.
  *  - Output buffers imported with gpsImportOutputBuffer hold two planes:
  *      [0, w*h*16)          RGBA float32 color (as above)
  *      [w*h*16, w*h*20)     float32 depth of the front-most splatted point per pixel, in
@@ -42,7 +44,7 @@
 extern "C" {
 #endif
 
-#define GPS_CUDA_API_VERSION 3
+#define GPS_CUDA_API_VERSION 4
 
 // Size in bytes of an output buffer (color plane + depth plane) for the given resolution.
 static inline uint64_t gpsOutputBufferSize(int32_t width, int32_t height)
@@ -101,6 +103,11 @@ typedef struct GpsFrameParams
   int32_t unbiasedSplatting;  // 1: unbiased (dilog-corrected) 2D splatting
   int32_t reducePointCount;   // 1: K = ss^2 points per thread, 0: one point per thread
   int32_t cullSmallGaussians;
+
+  // Alpha of the background (the color written where no point was splatted), 0 by default.
+  // The output alpha is coverage + (1 - coverage) * backgroundAlpha, where coverage is the
+  // fraction of the pixel's samples hit by a point (converges to 1 - transmittance).
+  float backgroundAlpha;
 } GpsFrameParams;
 
 // CUDA event timings of the last gpsRender* call, in milliseconds. Events are recorded on the

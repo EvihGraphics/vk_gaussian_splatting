@@ -50,7 +50,7 @@ public:
     float     fovyDeg   = 45.0f;
     float     nearPlane = 0.1f;
     float     farPlane  = 1000.0f;
-    glm::vec3 background{0.0f};
+    glm::vec4 background{0.0f};  // clear color of the raster pipelines (rgb + alpha)
     uint32_t  frameIndex = 0;
   };
 

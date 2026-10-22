@@ -191,6 +191,7 @@ bool GpsBridgeVk::render(const FrameInput& in, uint32_t frameSlot)
   fp.background[0] = in.background.x;
   fp.background[1] = in.background.y;
   fp.background[2] = in.background.z;
+  fp.backgroundAlpha = in.background.w;
   fp.frameIndex    = in.frameIndex;
 
   fp.supersamplingFactor       = prmGps.supersamplingFactor;

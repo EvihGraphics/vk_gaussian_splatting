@@ -2457,7 +2457,7 @@ void GaussianSplatting::renderGpsPipeline(VkCommandBuffer cmd, uint32_t splatCou
   in.fovyDeg           = float(cameraManip->getFov());
   in.nearPlane         = float(cameraManip->getClipPlanes().x);
   in.farPlane          = float(cameraManip->getClipPlanes().y);
-  in.background        = glm::vec3(m_clearColor.float32[0], m_clearColor.float32[1], m_clearColor.float32[2]);
+  in.background        = glm::vec4(m_clearColor.float32[0], m_clearColor.float32[1], m_clearColor.float32[2], m_clearColor.float32[3]);
   in.frameIndex        = m_gpsFrameIndex++;
 
   const uint32_t frameSlot = m_app->getFrameCycleIndex();

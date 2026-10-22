@@ -23,6 +23,44 @@
 #include <string>
 #include <vector>
 
+// ------------------------------------------------------------------------------------------------
+// Read access to private members of GaussianPointSplatting without modifying the submodule.
+// Explicit template instantiations may name private members ([temp.spec.general]), and the
+// friend function defined by the instantiation hands out the member pointer.
+// Needed: the per-frame sample buffers, to compute the pixel coverage (output alpha).
+// ------------------------------------------------------------------------------------------------
+namespace gps_private_access {
+template <typename Tag, typename Tag::type Member>
+struct Accessor
+{
+  friend typename Tag::type get(Tag) { return Member; }
+};
+struct ImageBufferA
+{
+  using type = uint64_t* GaussianPointSplatting::*;
+  friend type get(ImageBufferA);
+};
+struct ImageBufferB
+{
+  using type = uint64_t* GaussianPointSplatting::*;
+  friend type get(ImageBufferB);
+};
+struct ImageBufferSize
+{
+  using type = uint32_t GaussianPointSplatting::*;
+  friend type get(ImageBufferSize);
+};
+struct NumPasses
+{
+  using type = int GaussianPointSplatting::*;
+  friend type get(NumPasses);
+};
+template struct Accessor<ImageBufferA, &GaussianPointSplatting::d_imageBufferA>;
+template struct Accessor<ImageBufferB, &GaussianPointSplatting::d_imageBufferB>;
+template struct Accessor<ImageBufferSize, &GaussianPointSplatting::imageBufferSize>;
+template struct Accessor<NumPasses, &GaussianPointSplatting::numPasses>;
+}  // namespace gps_private_access
+
 namespace {
 
 thread_local std::string g_lastError;
@@ -116,17 +154,32 @@ __global__ void fillFloatKernel(float* dst, float value, int n)
     dst[i] = value;
 }
 
+// Per-frame sample buffer of GaussianPointSplatting (one 64-bit depth|color word per
+// sub-pixel sample and render pass). Used to compute the pixel coverage (alpha).
+struct SampleBufferView
+{
+  const uint64_t* samples       = nullptr;
+  uint32_t        size          = 0;
+  int             numPasses     = 1;
+  int             supersampling = 1;
+  uint64_t        emptyValue    = 0;  // value of samples no point was splatted to (cleared background)
+  float           backgroundAlpha = 0.0f;
+};
+
 // GPS colour buffer (glm::vec3, row 0 = bottom) -> RGBA float, row 0 = top.
+// Alpha = fraction of the pixel's samples covered by a point (stochastic transparency: its
+// expectation is 1 - transmittance), composited over backgroundAlpha.
 // GPS depth buffer (OpenGL NDC z in [-1,1] of the front-most point, row 0 = bottom)
 // -> Vulkan [0,1] depth (perspectiveRH_ZO with the same near/far), row 0 = top.
 __global__ void convertOutputKernel(const glm::vec3* __restrict__ srcColor,
                                     const float* __restrict__ srcDepth,
                                     float4* __restrict__ dstColor,
                                     float* __restrict__ dstDepth,
-                                    int   width,
-                                    int   height,
-                                    float nearPlane,
-                                    float farPlane)
+                                    int              width,
+                                    int              height,
+                                    float            nearPlane,
+                                    float            farPlane,
+                                    SampleBufferView sampleBuffer)
 {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -135,8 +188,30 @@ __global__ void convertOutputKernel(const glm::vec3* __restrict__ srcColor,
   const int src = y * width + x;
   const int dst = (height - 1 - y) * width + x;
 
+  // Coverage, with the same sample addressing as GPS processImageBuffer()
+  float alpha = 1.0f;
+  if(sampleBuffer.samples)
+  {
+    const int ss       = sampleBuffer.supersampling;
+    const int upWidth  = width * ss;
+    const int upHeight = height * ss;
+    int       covered = 0, total = 0;
+    for(int dx = 0; dx < ss; ++dx)
+      for(int dy = 0; dy < ss; ++dy)
+        for(int p = 0; p < sampleBuffer.numPasses; ++p)
+        {
+          const int i = posToMemory(x * ss + dx, y * ss + dy, p, sampleBuffer.numPasses, upWidth, upHeight);
+          if(i >= int(sampleBuffer.size))
+            continue;
+          ++total;
+          covered += (sampleBuffer.samples[i] != sampleBuffer.emptyValue) ? 1 : 0;
+        }
+    const float coverage = total > 0 ? float(covered) / float(total) : 0.0f;
+    alpha                = coverage + (1.0f - coverage) * sampleBuffer.backgroundAlpha;
+  }
+
   const glm::vec3 c = srcColor[src];
-  dstColor[dst]     = make_float4(c.x, c.y, c.z, 1.0f);
+  dstColor[dst]     = make_float4(c.x, c.y, c.z, alpha);
 
   if(dstDepth)
   {
@@ -291,10 +366,22 @@ GpsResult renderInternal(GpsContext* ctx, const GpsFrameParams* params, float4* 
 
   GPS_CUDA_TRY(cudaEventRecord(ctx->evSplatDone, 0));
 
+  // Sample buffer of this frame: GaussianPointSplatting::get_current_image_buffer() logic
+  // (ping-pong on settings.frame), and the clear value of GaussianPointSplatting::render().
+  namespace pa = gps_private_access;
+  GaussianPointSplatting& gps = *ctx->pass;
+  SampleBufferView        sampleBuffer;
+  sampleBuffer.samples         = (ctx->settings.frame % 2 == 0) ? gps.*get(pa::ImageBufferA{}) : gps.*get(pa::ImageBufferB{});
+  sampleBuffer.size            = gps.*get(pa::ImageBufferSize{});
+  sampleBuffer.numPasses       = gps.*get(pa::NumPasses{});
+  sampleBuffer.supersampling   = ctx->settings.supersampling_factor;
+  sampleBuffer.emptyValue      = 0xFFFFFFF000000000ull | CudaMath::vec3To36Bits(ctx->settings.backgroundColor);
+  sampleBuffer.backgroundAlpha = fminf(fmaxf(params->backgroundAlpha, 0.0f), 1.0f);
+
   dim3 block(16, 16);
   dim3 grid((ctx->width + block.x - 1) / block.x, (ctx->height + block.y - 1) / block.y);
   convertOutputKernel<<<grid, block>>>(ctx->d_color, ctx->d_depth, dstColor, dstDepth, ctx->width, ctx->height,
-                                       ctx->settings.near_view_plane, ctx->settings.far_view_plane);
+                                       ctx->settings.near_view_plane, ctx->settings.far_view_plane, sampleBuffer);
   GPS_CUDA_TRY(cudaGetLastError());
 
   GPS_CUDA_TRY(cudaEventRecord(ctx->evStop, 0));
